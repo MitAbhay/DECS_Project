@@ -1,129 +1,101 @@
 /*
 Compile:
-gcc -O2 -pthread loadgen.c -o loadgen -lcurl
+gcc -O2 -Wall loadgen_simple.c -o loadgen -lcurl -lpthread
 
-But we'll use simple sockets via libcurl would be easier. To reduce dependencies we use libcurl.
-Install: sudo apt install libcurl4-openssl-dev
-Compile: gcc -O2 -pthread loadgen.c -o loadgen -lcurl
+Usage:
+./loadgen <server_url> <threads> <requests_per_thread>
+
+Example:
+./loadgen http://127.0.0.1:8080 4 100
 */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <pthread.h>
-#include <time.h>
 #include <string.h>
 #include <curl/curl.h>
 #include <sys/time.h>
 
 typedef struct
 {
-    char server_url[256];
-    int thread_id;
-    int updates_perc; // percentage of requests that are updates
-    int top_n;
-    int runtime; // seconds per thread
-    long requests_sent;
-    long requests_ok;
-    double total_latency_ms;
-} thread_arg_t;
+    const char *base_url;
+    int requests;
+} ThreadArgs;
 
-static size_t write_cb(void *ptr, size_t size, size_t nmemb, void *userdata) { return size * nmemb; }
-
-static double now_ms()
+double now_ms()
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+    struct timeval t;
+    gettimeofday(&t, NULL);
+    return t.tv_sec * 1000.0 + t.tv_usec / 1000.0;
 }
 
 void *worker(void *arg)
 {
-    thread_arg_t *t = (thread_arg_t *)arg;
+    ThreadArgs *ta = (ThreadArgs *)arg;
     CURL *curl = curl_easy_init();
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
-    srand(time(NULL) + t->thread_id);
-    double end_time = now_ms() + t->runtime * 1000.0;
-    while (now_ms() < end_time)
+
+    if (!curl)
+        pthread_exit(NULL);
+
+    char url[256];
+    for (int i = 0; i < ta->requests; i++)
     {
-        int r = rand() % 100;
-        double start = now_ms();
-        if (r < t->updates_perc)
-        {
-            // POST update
-            int pid = rand() % 100000;
-            int score = rand() % 1000000;
-            char url[512];
-            snprintf(url, sizeof(url), "%s/update_score?player_id=%d&score=%d", t->server_url, pid, score);
-            curl_easy_setopt(curl, CURLOPT_URL, url);
-            curl_easy_setopt(curl, CURLOPT_POST, 1L);
-            curl_easy_setopt(curl, CURLOPT_POSTFIELDS, "");
-            CURLcode res = curl_easy_perform(curl);
-            t->requests_sent++;
-            if (res == CURLE_OK)
-                t->requests_ok++;
-        }
-        else
-        {
-            // GET leaderboard
-            char url[512];
-            snprintf(url, sizeof(url), "%s/leaderboard?top=%d", t->server_url, t->top_n);
-            curl_easy_setopt(curl, CURLOPT_URL, url);
-            curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
-            CURLcode res = curl_easy_perform(curl);
-            t->requests_sent++;
-            if (res == CURLE_OK)
-                t->requests_ok++;
-        }
-        double lat = now_ms() - start;
-        t->total_latency_ms += lat;
-        // zero think time for saturation tests; you can add nanosleep if needed
+        int pid = rand() % 1000 + 1;
+        int score = rand() % 5000;
+
+        // POST update
+        snprintf(url, sizeof(url), "%s/update_score?player_id=%d&score=%d", ta->base_url, pid, score);
+        curl_easy_setopt(curl, CURLOPT_URL, url);
+        curl_easy_setopt(curl, CURLOPT_POST, 1L);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 500L);
+        curl_easy_perform(curl);
+
+        // GET leaderboard
+        snprintf(url, sizeof(url), "%s/leaderboard?top=5", ta->base_url);
+        curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
+        curl_easy_setopt(curl, CURLOPT_URL, url);
+        curl_easy_perform(curl);
     }
+
     curl_easy_cleanup(curl);
-    return NULL;
+    pthread_exit(NULL);
 }
 
 int main(int argc, char **argv)
 {
-    if (argc < 6)
+    if (argc < 4)
     {
-        fprintf(stderr, "Usage: %s <server_url> <num_threads> <upt_pct> <top_n> <run_seconds>\n", argv[0]);
-        fprintf(stderr, "upt_pct = percentage updates (0-100)\n");
+        printf("Usage: %s <server_url> <threads> <requests_per_thread>\n", argv[0]);
         return 1;
     }
-    char server[256];
-    strcpy(server, argv[1]);
-    int num_threads = atoi(argv[2]);
-    int upd_pct = atoi(argv[3]);
-    int top_n = atoi(argv[4]);
-    int run_seconds = atoi(argv[5]);
 
+    const char *url = argv[1];
+    int threads = atoi(argv[2]);
+    int reqs = atoi(argv[3]);
+
+    srand(time(NULL));
     curl_global_init(CURL_GLOBAL_ALL);
-    pthread_t threads[num_threads];
-    thread_arg_t args[num_threads];
-    for (int i = 0; i < num_threads; i++)
-    {
-        snprintf(args[i].server_url, sizeof(args[i].server_url), "%s", server);
-        args[i].thread_id = i;
-        args[i].updates_perc = upd_pct;
-        args[i].top_n = top_n;
-        args[i].runtime = run_seconds;
-        args[i].requests_sent = 0;
-        args[i].requests_ok = 0;
-        args[i].total_latency_ms = 0.0;
-        pthread_create(&threads[i], NULL, worker, &args[i]);
-    }
-    long total_sent = 0, total_ok = 0;
-    double total_latency = 0.0;
-    for (int i = 0; i < num_threads; i++)
-    {
-        pthread_join(threads[i], NULL);
-        total_sent += args[i].requests_sent;
-        total_ok += args[i].requests_ok;
-        total_latency += args[i].total_latency_ms;
-    }
-    double avg_latency = (total_ok > 0) ? (total_latency / total_ok) : 0.0;
-    printf("Threads: %d, Total sent: %ld, OK: %ld, Throughput(req/s): %.2f, Avg latency(ms): %.2f\n",
-           num_threads, total_sent, total_ok, (double)total_ok / run_seconds, avg_latency);
+
+    pthread_t tids[threads];
+    ThreadArgs args = {url, reqs};
+
+    double start = now_ms();
+
+    for (int i = 0; i < threads; i++)
+        pthread_create(&tids[i], NULL, worker, &args);
+
+    for (int i = 0; i < threads; i++)
+        pthread_join(tids[i], NULL);
+
+    double end = now_ms();
+    double total = threads * reqs * 2; // each loop = 1 update + 1 get
+
+    printf("\n=== Load Test Summary ===\n");
+    printf("Threads: %d, Requests/thread: %d\n", threads, reqs);
+    printf("Total requests: %.0f\n", total);
+    printf("Elapsed time: %.2f sec\n", (end - start) / 1000.0);
+    printf("Throughput: %.2f req/sec\n", total / ((end - start) / 1000.0));
+
     curl_global_cleanup();
     return 0;
 }
