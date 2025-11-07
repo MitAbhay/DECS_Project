@@ -14,6 +14,7 @@ mode = 0 (DB-only), 1 (Cache-only), 2 (Hybrid)
 #include <string.h>
 #include <signal.h>
 #include <unistd.h>
+#include <sys/time.h>
 
 #define MAX_PLAYERS 10000
 #define DEFAULT_PORT 8080
@@ -30,6 +31,13 @@ static int cache_size = 0;
 static PGconn *conn = NULL;
 static int mode = 0; // 0=DB, 1=Cache, 2=Hybrid
 
+long long now_us()
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (long long)tv.tv_sec * 1000000 + tv.tv_usec;
+}
+
 // ---------- DB Section ----------
 void init_db()
 {
@@ -42,6 +50,10 @@ void init_db()
     const char *create_sql =
         "CREATE TABLE IF NOT EXISTS leaderboard (player_id INT PRIMARY KEY, score INT, last_updated TIMESTAMP DEFAULT now());";
     PQexec(conn, create_sql);
+    printf("Connected to DB: %s\n", PQdb(conn));
+    printf("User: %s\n", PQuser(conn));
+    printf("Host: %s\n", PQhost(conn));
+    printf("Port: %s\n", PQport(conn));
 }
 
 void db_update(int id, int score)
@@ -52,7 +64,19 @@ void db_update(int id, int score)
              "VALUES (%d, %d, now()) "
              "ON CONFLICT (player_id) DO UPDATE SET score = EXCLUDED.score, last_updated = now();",
              id, score);
-    PQexec(conn, q);
+
+    PGresult *res = PQexec(conn, q);
+
+    if (PQresultStatus(res) != PGRES_COMMAND_OK)
+    {
+        fprintf(stderr, "DB ERROR on update: %s\nQuery: %s\n", PQerrorMessage(conn), q);
+    }
+    else
+    {
+        printf("[DB WRITE] player_id=%d score=%d\n", id, score);
+    }
+
+    PQclear(res);
 }
 
 int db_get_top(Player *arr, int limit)
@@ -113,16 +137,30 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn_htt
 {
     if (strcmp(method, "GET") == 0 && strncmp(url, "/leaderboard", 12) == 0)
     {
+        long long start = now_us(); // measure start
+
         const char *top_q = MHD_lookup_connection_value(conn_http, MHD_GET_ARGUMENT_KIND, "top");
         int top = top_q ? atoi(top_q) : DEFAULT_TOP;
 
         Player top_players[DEFAULT_TOP];
         int count = 0;
+        int cache_hit = 0;
 
         if (mode == 0)
+        {
             count = db_get_top(top_players, top);
+            cache_hit = 0; // DB path
+        }
         else
+        {
             count = cache_get_top(top_players, top);
+            cache_hit = 1; // Cache path
+        }
+
+        long long end = now_us();
+        printf("[LEADERBOARD] mode=%d cache_hit=%d latency=%lld us\n",
+               mode, cache_hit, (end - start));
+        fflush(stdout);
 
         // build JSON
         char json[2048] = "{\"leaderboard\":[";
@@ -144,6 +182,8 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn_htt
 
     if (strcmp(method, "POST") == 0 && strncmp(url, "/update_score", 13) == 0)
     {
+        long long start = now_us(); // start timing
+
         const char *id_q = MHD_lookup_connection_value(conn_http, MHD_GET_ARGUMENT_KIND, "player_id");
         const char *score_q = MHD_lookup_connection_value(conn_http, MHD_GET_ARGUMENT_KIND, "score");
         if (!id_q || !score_q)
@@ -154,18 +194,34 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn_htt
             MHD_destroy_response(res);
             return ret;
         }
+
         int id = atoi(id_q);
         int score = atoi(score_q);
 
+        int wrote_cache = 0, wrote_db = 0;
+
         if (mode == 0)
+        {
             db_update(id, score);
+            wrote_db = 1;
+        }
         else if (mode == 1)
+        {
             cache_update(id, score);
+            wrote_cache = 1;
+        }
         else
         { // hybrid
             cache_update(id, score);
             db_update(id, score);
+            wrote_cache = 1;
+            wrote_db = 1;
         }
+
+        long long end = now_us();
+        printf("[UPDATE] mode=%d wrote_cache=%d wrote_db=%d latency=%lld us (id=%d score=%d)\n",
+               mode, wrote_cache, wrote_db, (end - start), id, score);
+        fflush(stdout);
 
         const char *ok = "{\"status\":\"ok\"}";
         struct MHD_Response *res = MHD_create_response_from_buffer(strlen(ok), (void *)ok, MHD_RESPMEM_PERSISTENT);
