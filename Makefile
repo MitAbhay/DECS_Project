@@ -1,14 +1,25 @@
 CC = gcc
 CFLAGS = -O2 -Wall -pthread
-LIBS = -lmicrohttpd -lpq -I/usr/include/postgresql
+INCLUDES = -I/usr/include/postgresql
+LIBS_SERVER = -lmicrohttpd -lpq
+LIBS_LOADGEN = -lcurl -lpthread
 
-all: server loadgen
+# Executable names
+SERVER = server
+LOADGEN = loadgen
 
-server: server.c skiplist.c skiplist.h config.h
-	$(CC) $(CFLAGS) server.c -o server $(LIBS)
+# Source files
+SERVER_SRC = server.c
+LOADGEN_SRC = loadgen.c
 
-loadgen: loadgen.c
-	$(CC) $(CFLAGS) loadgen.c -o loadgen -lcurl
+# Default target
+all: $(SERVER) $(LOADGEN)
+
+$(SERVER): $(SERVER_SRC)
+	$(CC) $(CFLAGS) $(INCLUDES) -o $(SERVER) $(SERVER_SRC) $(LIBS_SERVER)
+
+$(LOADGEN): $(LOADGEN_SRC)
+	$(CC) $(CFLAGS) -o $(LOADGEN) $(LOADGEN_SRC) $(LIBS_LOADGEN)
 
 clean:
-	rm -f server loadgen
+	rm -f $(SERVER) $(LOADGEN)

@@ -41,7 +41,7 @@ void *worker(void *arg)
     for (int i = 0; i < ta->requests; i++)
     {
         int pid = rand() % 1000 + 1;
-        int score = rand() % 5000;
+        int score = rand() % 50000;
 
         // POST update
         snprintf(url, sizeof(url), "%s/update_score?player_id=%d&score=%d", ta->base_url, pid, score);
