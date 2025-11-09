@@ -15,10 +15,28 @@ mode = 0 (DB-only), 1 (Cache-only), 2 (Hybrid)
 #include <signal.h>
 #include <unistd.h>
 #include <sys/time.h>
+#include <pthread.h>
 
 #define MAX_PLAYERS 10000
 #define DEFAULT_PORT 8080
 #define DEFAULT_TOP 10
+
+#define MAX_CACHE_SIZE 10000
+
+typedef struct LRUNode
+{
+    int id;
+    int score;
+    struct LRUNode *prev, *next;
+} LRUNode;
+
+LRUNode *head = NULL, *tail = NULL;
+int cache_count = 0;
+
+// Hash map: player_id → pointer to node
+LRUNode *cache_map[MAX_CACHE_SIZE]; // initialize to NULL automatically
+
+pthread_mutex_t cache_lock = PTHREAD_MUTEX_INITIALIZER;
 
 typedef struct
 {
@@ -26,8 +44,6 @@ typedef struct
     int score;
 } Player;
 
-static Player cache[MAX_PLAYERS];
-static int cache_size = 0;
 static PGconn *conn = NULL;
 static int mode = 0; // 0=DB, 1=Cache, 2=Hybrid
 
@@ -56,34 +72,31 @@ void init_db()
     printf("Port: %s\n", PQport(conn));
 }
 
+PGconn *connect_db()
+{
+    PGconn *c = PQconnectdb("host=127.0.0.1 port=5432 dbname=leaderboard_db user=leaderboard_user password=leaderboard_pw");
+    return c;
+}
+
 void db_update(int id, int score)
 {
+    PGconn *c = connect_db();
     char q[256];
     snprintf(q, sizeof(q),
              "INSERT INTO leaderboard (player_id, score, last_updated) "
              "VALUES (%d, %d, now()) "
              "ON CONFLICT (player_id) DO UPDATE SET score = EXCLUDED.score, last_updated = now();",
              id, score);
-
-    PGresult *res = PQexec(conn, q);
-
-    if (PQresultStatus(res) != PGRES_COMMAND_OK)
-    {
-        fprintf(stderr, "DB ERROR on update: %s\nQuery: %s\n", PQerrorMessage(conn), q);
-    }
-    else
-    {
-        printf("[DB WRITE] player_id=%d score=%d\n", id, score);
-    }
-
-    PQclear(res);
+    PQexec(c, q);
+    PQfinish(c);
 }
 
 int db_get_top(Player *arr, int limit)
 {
+    PGconn *c = connect_db();
     char q[128];
     snprintf(q, sizeof(q), "SELECT player_id, score FROM leaderboard ORDER BY score DESC LIMIT %d;", limit);
-    PGresult *res = PQexec(conn, q);
+    PGresult *res = PQexec(c, q);
     int rows = PQntuples(res);
     for (int i = 0; i < rows; i++)
     {
@@ -91,28 +104,73 @@ int db_get_top(Player *arr, int limit)
         arr[i].score = atoi(PQgetvalue(res, i, 1));
     }
     PQclear(res);
+    PQfinish(c);
     return rows;
 }
 
 // ---------- Cache Section ----------
+
+void lru_remove(LRUNode *node)
+{
+    if (!node)
+        return;
+
+    if (node->prev)
+        node->prev->next = node->next;
+    else
+        head = node->next;
+
+    if (node->next)
+        node->next->prev = node->prev;
+    else
+        tail = node->prev;
+}
+
+void lru_push_front(LRUNode *node)
+{
+    node->next = head;
+    node->prev = NULL;
+    if (head)
+        head->prev = node;
+    head = node;
+    if (tail == NULL)
+        tail = node;
+}
+
 void cache_update(int id, int score)
 {
-    // if exists, update
-    for (int i = 0; i < cache_size; i++)
+    pthread_mutex_lock(&cache_lock);
+
+    LRUNode *node = cache_map[id];
+
+    // Case 1: Entry exists → update + move to front
+    if (node)
     {
-        if (cache[i].id == id)
-        {
-            cache[i].score = score;
-            return;
-        }
+        node->score = score;
+        lru_remove(node);
+        lru_push_front(node);
+        pthread_mutex_unlock(&cache_lock);
+        return;
     }
-    // new entry
-    if (cache_size < MAX_PLAYERS)
+
+    // Case 2: Cache full → evict LRU entry (tail)
+    if (cache_count >= MAX_CACHE_SIZE)
     {
-        cache[cache_size].id = id;
-        cache[cache_size].score = score;
-        cache_size++;
+        cache_map[tail->id] = NULL;
+        lru_remove(tail);
+        free(tail);
+        cache_count--;
     }
+
+    // Case 3: Create new entry
+    node = (LRUNode *)malloc(sizeof(LRUNode));
+    node->id = id;
+    node->score = score;
+    lru_push_front(node);
+    cache_map[id] = node;
+    cache_count++;
+
+    pthread_mutex_unlock(&cache_lock);
 }
 
 int cmp_desc(const void *a, const void *b)
@@ -123,10 +181,29 @@ int cmp_desc(const void *a, const void *b)
 
 int cache_get_top(Player *out, int limit)
 {
-    qsort(cache, cache_size, sizeof(Player), cmp_desc);
-    int n = (cache_size < limit) ? cache_size : limit;
-    memcpy(out, cache, n * sizeof(Player));
-    return n;
+    pthread_mutex_lock(&cache_lock);
+
+    // Copy all nodes into temporary array
+    Player temp[MAX_CACHE_SIZE];
+    int n = 0;
+    LRUNode *cur = head;
+    while (cur && n < cache_count)
+    {
+        temp[n].id = cur->id;
+        temp[n].score = cur->score;
+        cur = cur->next;
+        n++;
+    }
+
+    // Sort by score (descending)
+    qsort(temp, n, sizeof(Player), cmp_desc);
+
+    // Copy top N to output
+    int ret = (n < limit) ? n : limit;
+    memcpy(out, temp, ret * sizeof(Player));
+
+    pthread_mutex_unlock(&cache_lock);
+    return ret;
 }
 
 // ---------- HTTP Handlers ----------
@@ -262,8 +339,13 @@ int main(int argc, char **argv)
 
     signal(SIGINT, cleanup);
 
-    http_daemon = MHD_start_daemon(MHD_USE_SELECT_INTERNALLY, port, NULL, NULL,
-                                   &handle_request, NULL, MHD_OPTION_END);
+    http_daemon = MHD_start_daemon(
+        MHD_USE_SELECT_INTERNALLY,
+        port,
+        NULL, NULL,
+        &handle_request, NULL,
+        MHD_OPTION_THREAD_POOL_SIZE, 8, // <--- 8 threads
+        MHD_OPTION_END);
     if (!http_daemon)
     {
         fprintf(stderr, "Failed to start HTTP server\n");
