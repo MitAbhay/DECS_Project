@@ -16,26 +16,25 @@ mode = 0 (DB-only), 1 (Cache-only), 2 (Hybrid)
 #include <unistd.h>
 #include <sys/time.h>
 #include <pthread.h>
+#include "uthash.h"
 
 #define MAX_PLAYERS 10000
 #define DEFAULT_PORT 8080
 #define DEFAULT_TOP 10
 
-#define MAX_CACHE_SIZE 10000
+#define MAX_CACHE_SIZE 1000
 
 typedef struct LRUNode
 {
     int id;
     int score;
     struct LRUNode *prev, *next;
+    UT_hash_handle hh; /* makes this struct hashable by uthash */
 } LRUNode;
 
-LRUNode *head = NULL, *tail = NULL;
-int cache_count = 0;
-
-// Hash map: player_id → pointer to node
-LRUNode *cache_map[MAX_CACHE_SIZE]; // initialize to NULL automatically
-
+static LRUNode *head = NULL, *tail = NULL;
+static int cache_count = 0;
+static LRUNode *cache_map = NULL; /* uthash hash table root (player_id -> node) */
 pthread_mutex_t cache_lock = PTHREAD_MUTEX_INITIALIZER;
 
 typedef struct
@@ -141,9 +140,10 @@ void cache_update(int id, int score)
 {
     pthread_mutex_lock(&cache_lock);
 
-    LRUNode *node = cache_map[id];
+    LRUNode *node = NULL;
+    HASH_FIND_INT(cache_map, &id, node);
 
-    // Case 1: Entry exists → update + move to front
+    /* If exists, update and move to front */
     if (node)
     {
         node->score = score;
@@ -153,21 +153,32 @@ void cache_update(int id, int score)
         return;
     }
 
-    // Case 2: Cache full → evict LRU entry (tail)
+    /* Evict if full */
     if (cache_count >= MAX_CACHE_SIZE)
     {
-        cache_map[tail->id] = NULL;
-        lru_remove(tail);
-        free(tail);
+        /* remove tail from hash and LRU list */
+        int evict_id = tail->id;
+        HASH_DEL(cache_map, tail);
+        LRUNode *old_tail = tail;
+        lru_remove(old_tail);
+        free(old_tail);
         cache_count--;
     }
 
-    // Case 3: Create new entry
+    /* Create new node */
     node = (LRUNode *)malloc(sizeof(LRUNode));
+    if (!node)
+    {
+        pthread_mutex_unlock(&cache_lock);
+        return;
+    }
     node->id = id;
     node->score = score;
+    node->prev = node->next = NULL;
+
+    /* insert into LRU front and into hash */
     lru_push_front(node);
-    cache_map[id] = node;
+    HASH_ADD_INT(cache_map, id, node);
     cache_count++;
 
     pthread_mutex_unlock(&cache_lock);
@@ -183,9 +194,9 @@ int cache_get_top(Player *out, int limit)
 {
     pthread_mutex_lock(&cache_lock);
 
-    // Copy all nodes into temporary array
-    Player temp[MAX_CACHE_SIZE];
+    /* temp array sized by cache_count (bounded by MAX_CACHE_SIZE) */
     int n = 0;
+    Player temp[MAX_CACHE_SIZE];
     LRUNode *cur = head;
     while (cur && n < cache_count)
     {
@@ -195,17 +206,15 @@ int cache_get_top(Player *out, int limit)
         n++;
     }
 
-    // Sort by score (descending)
+    /* sort by score desc */
     qsort(temp, n, sizeof(Player), cmp_desc);
 
-    // Copy top N to output
     int ret = (n < limit) ? n : limit;
     memcpy(out, temp, ret * sizeof(Player));
 
     pthread_mutex_unlock(&cache_lock);
     return ret;
 }
-
 // ---------- HTTP Handlers ----------
 static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn_http,
                                       const char *url, const char *method,

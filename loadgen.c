@@ -40,7 +40,7 @@ void *worker(void *arg)
     char url[256];
     for (int i = 0; i < ta->requests; i++)
     {
-        int pid = rand() % 1000 + 1;
+        int pid = rand() % 10000 + 1;
         int score = rand() % 50000;
 
         // POST update
