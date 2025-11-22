@@ -239,8 +239,10 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn_htt
         }
         else
         {
-            count = cache_get_top(top_players, top);
-            cache_hit = 1; // Cache path
+            // count = cache_get_top(top_players, top);
+            count = db_get_top(top_players, top);
+            cache_hit = 0;
+            // cache_hit = 1; // Cache path
         }
 
         long long end = now_us();
