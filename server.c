@@ -23,6 +23,7 @@ mode = 0 (DB-only), 1 (Cache-only), 2 (Hybrid)
 #define DEFAULT_TOP 10
 
 #define MAX_CACHE_SIZE 1000
+#define POOL_SIZE 8
 
 typedef struct LRUNode
 {
@@ -31,6 +32,11 @@ typedef struct LRUNode
     struct LRUNode *prev, *next;
     UT_hash_handle hh; /* makes this struct hashable by uthash */
 } LRUNode;
+
+static PGconn *pool[POOL_SIZE];
+static int pool_busy[POOL_SIZE];
+pthread_mutex_t pool_lock = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t pool_wait = PTHREAD_COND_INITIALIZER;
 
 static LRUNode *head = NULL, *tail = NULL;
 static int cache_count = 0;
@@ -54,6 +60,76 @@ long long now_us()
 }
 
 // ---------- DB Section ----------
+
+PGconn *create_new_connection()
+{
+    PGconn *c = PQconnectdb("host=127.0.0.1 port=5432 dbname=leaderboard_db user=leaderboard_user password=leaderboard_pw");
+
+    if (PQstatus(c) != CONNECTION_OK)
+    {
+        fprintf(stderr, "Connection failed: %s\n", PQerrorMessage(c));
+        return NULL;
+    }
+    printf("Connected to DB: %s\n", PQdb(c));
+    printf("User: %s\n", PQuser(c));
+    printf("Host: %s\n", PQhost(c));
+    printf("Port: %s\n", PQport(c));
+    return c;
+}
+
+void pool_init()
+{
+    for (int i = 0; i < POOL_SIZE; i++)
+    {
+        pool[i] = create_new_connection();
+        pool_busy[i] = 0;
+    }
+}
+
+PGconn *pool_get_connection()
+{
+    pthread_mutex_lock(&pool_lock);
+
+    while (1)
+    {
+        for (int i = 0; i < POOL_SIZE; i++)
+        {
+            if (!pool_busy[i])
+            {
+                pool_busy[i] = 1;
+                PGconn *c = pool[i];
+
+                // auto-repair dead connections
+                if (PQstatus(c) != CONNECTION_OK)
+                {
+                    PQreset(c);
+                }
+
+                pthread_mutex_unlock(&pool_lock);
+                return c;
+            }
+        }
+        pthread_cond_wait(&pool_wait, &pool_lock);
+    }
+}
+
+void pool_release_connection(PGconn *c)
+{
+    pthread_mutex_lock(&pool_lock);
+
+    for (int i = 0; i < POOL_SIZE; i++)
+    {
+        if (pool[i] == c)
+        {
+            pool_busy[i] = 0;
+            break;
+        }
+    }
+
+    pthread_cond_signal(&pool_wait);
+    pthread_mutex_unlock(&pool_lock);
+}
+
 void init_db()
 {
     conn = PQconnectdb("host=127.0.0.1 port=5432 dbname=leaderboard_db user=leaderboard_user password=leaderboard_pw");
@@ -79,7 +155,7 @@ PGconn *connect_db()
 
 void db_update(int id, int score)
 {
-    PGconn *c = connect_db();
+    PGconn *c = pool_get_connection();
     char q[256];
     snprintf(q, sizeof(q),
              "INSERT INTO leaderboard (player_id, score, last_updated) "
@@ -87,12 +163,12 @@ void db_update(int id, int score)
              "ON CONFLICT (player_id) DO UPDATE SET score = EXCLUDED.score, last_updated = now();",
              id, score);
     PQexec(c, q);
-    PQfinish(c);
+    pool_release_connection(c);
 }
 
 int db_get_top(Player *arr, int limit)
 {
-    PGconn *c = connect_db();
+    PGconn *c = pool_get_connection();
     char q[128];
     snprintf(q, sizeof(q), "SELECT player_id, score FROM leaderboard ORDER BY score DESC LIMIT %d;", limit);
     PGresult *res = PQexec(c, q);
@@ -103,7 +179,7 @@ int db_get_top(Player *arr, int limit)
         arr[i].score = atoi(PQgetvalue(res, i, 1));
     }
     PQclear(res);
-    PQfinish(c);
+    pool_release_connection(c);
     return rows;
 }
 
@@ -346,7 +422,7 @@ int main(int argc, char **argv)
     printf("Starting server on port %d, mode=%d\n", port, mode);
 
     if (mode != 1)
-        init_db(); // DB required for modes 0 and 2
+        pool_init(); // DB required for modes 0 and 2
 
     signal(SIGINT, cleanup);
 
