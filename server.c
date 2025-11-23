@@ -1,6 +1,6 @@
 /*
 Compile:
-gcc -O2 -Wall server_simple.c -o server -lmicrohttpd -lpq
+gcc -O2 -Wall server_simple.c -o server -lmicrohttpd -lpq -pthread
 
 Usage:
 ./server <port> <mode>
@@ -23,7 +23,7 @@ mode = 0 (DB-only), 1 (Cache-only), 2 (Hybrid)
 #define DEFAULT_TOP 10
 
 #define MAX_CACHE_SIZE 1000
-#define POOL_SIZE 8
+#define POOL_SIZE 90
 
 typedef struct LRUNode
 {
@@ -49,7 +49,6 @@ typedef struct
     int score;
 } Player;
 
-static PGconn *conn = NULL;
 static int mode = 0; // 0=DB, 1=Cache, 2=Hybrid
 
 long long now_us()
@@ -65,9 +64,16 @@ PGconn *create_new_connection()
 {
     PGconn *c = PQconnectdb("host=127.0.0.1 port=5432 dbname=leaderboard_db user=leaderboard_user password=leaderboard_pw");
 
+    if (!c)
+    {
+        fprintf(stderr, "PQconnectdb returned NULL\n");
+        return NULL;
+    }
+
     if (PQstatus(c) != CONNECTION_OK)
     {
         fprintf(stderr, "Connection failed: %s\n", PQerrorMessage(c));
+        PQfinish(c);
         return NULL;
     }
     printf("Connected to DB: %s\n", PQdb(c));
@@ -82,6 +88,18 @@ void pool_init()
     for (int i = 0; i < POOL_SIZE; i++)
     {
         pool[i] = create_new_connection();
+        if (!pool[i])
+        {
+            fprintf(stderr, "Failed to initialize DB pool at index %d\n", i);
+            // Clean up any connections created so far.
+            for (int j = 0; j < i; j++)
+            {
+                if (pool[j])
+                    PQfinish(pool[j]);
+                pool[j] = NULL;
+            }
+            exit(1);
+        }
         pool_busy[i] = 0;
     }
 }
@@ -103,6 +121,11 @@ PGconn *pool_get_connection()
                 if (PQstatus(c) != CONNECTION_OK)
                 {
                     PQreset(c);
+                    if (PQstatus(c) != CONNECTION_OK)
+                    {
+                        fprintf(stderr, "Warning: PQreset failed: %s\n", PQerrorMessage(c));
+                        // allow caller to detect error via PQresultStatus checks
+                    }
                 }
 
                 pthread_mutex_unlock(&pool_lock);
@@ -130,48 +153,67 @@ void pool_release_connection(PGconn *c)
     pthread_mutex_unlock(&pool_lock);
 }
 
-void init_db()
-{
-    conn = PQconnectdb("host=127.0.0.1 port=5432 dbname=leaderboard_db user=leaderboard_user password=leaderboard_pw");
-    if (PQstatus(conn) != CONNECTION_OK)
-    {
-        fprintf(stderr, "DB Connection failed: %s\n", PQerrorMessage(conn));
-        exit(1);
-    }
-    const char *create_sql =
-        "CREATE TABLE IF NOT EXISTS leaderboard (player_id INT PRIMARY KEY, score INT, last_updated TIMESTAMP DEFAULT now());";
-    PQexec(conn, create_sql);
-    printf("Connected to DB: %s\n", PQdb(conn));
-    printf("User: %s\n", PQuser(conn));
-    printf("Host: %s\n", PQhost(conn));
-    printf("Port: %s\n", PQport(conn));
-}
-
-PGconn *connect_db()
-{
-    PGconn *c = PQconnectdb("host=127.0.0.1 port=5432 dbname=leaderboard_db user=leaderboard_user password=leaderboard_pw");
-    return c;
-}
-
 void db_update(int id, int score)
 {
     PGconn *c = pool_get_connection();
+    if (!c)
+    {
+        fprintf(stderr, "db_update: no connection available\n");
+        return;
+    }
+
     char q[256];
     snprintf(q, sizeof(q),
              "INSERT INTO leaderboard (player_id, score, last_updated) "
              "VALUES (%d, %d, now()) "
              "ON CONFLICT (player_id) DO UPDATE SET score = EXCLUDED.score, last_updated = now();",
              id, score);
-    PQexec(c, q);
+
+    PGresult *res = PQexec(c, q);
+    if (!res)
+    {
+        fprintf(stderr, "db_update: PQexec returned NULL\n");
+    }
+    else
+    {
+        if (PQresultStatus(res) != PGRES_COMMAND_OK)
+        {
+            fprintf(stderr, "db_update: query failed: %s\n", PQerrorMessage(c));
+        }
+        PQclear(res);
+    }
+
     pool_release_connection(c);
 }
 
 int db_get_top(Player *arr, int limit)
 {
     PGconn *c = pool_get_connection();
+    if (!c)
+    {
+        fprintf(stderr, "db_get_top: no connection available\n");
+        return 0;
+    }
+
     char q[128];
     snprintf(q, sizeof(q), "SELECT player_id, score FROM leaderboard ORDER BY score DESC LIMIT %d;", limit);
+
     PGresult *res = PQexec(c, q);
+    if (!res)
+    {
+        fprintf(stderr, "db_get_top: PQexec returned NULL\n");
+        pool_release_connection(c);
+        return 0;
+    }
+
+    if (PQresultStatus(res) != PGRES_TUPLES_OK)
+    {
+        fprintf(stderr, "db_get_top: query failed: %s\n", PQerrorMessage(c));
+        PQclear(res);
+        pool_release_connection(c);
+        return 0;
+    }
+
     int rows = PQntuples(res);
     for (int i = 0; i < rows; i++)
     {
@@ -181,6 +223,60 @@ int db_get_top(Player *arr, int limit)
     PQclear(res);
     pool_release_connection(c);
     return rows;
+}
+
+int db_get_score(int id)
+{
+    PGconn *c = pool_get_connection();
+    if (!c)
+    {
+        fprintf(stderr, "db_get_score: no connection available\n");
+        return -1;
+    }
+
+    char q[128];
+    snprintf(q, sizeof(q),
+             "SELECT score FROM leaderboard WHERE player_id=%d;", id);
+
+    PGresult *res = PQexec(c, q);
+    if (!res)
+    {
+        fprintf(stderr, "db_get_score: PQexec returned NULL\n");
+        pool_release_connection(c);
+        return -1;
+    }
+
+    if (PQresultStatus(res) != PGRES_TUPLES_OK)
+    {
+        // no rows or error
+        // If it's an error, log it.
+        if (PQntuples(res) == 0)
+        {
+            PQclear(res);
+            pool_release_connection(c);
+            return -1;
+        }
+        else
+        {
+            fprintf(stderr, "db_get_score: query failed: %s\n", PQerrorMessage(c));
+            PQclear(res);
+            pool_release_connection(c);
+            return -1;
+        }
+    }
+
+    int rows = PQntuples(res);
+    if (rows == 0)
+    {
+        PQclear(res);
+        pool_release_connection(c);
+        return -1;
+    }
+
+    int score = atoi(PQgetvalue(res, 0, 0));
+    PQclear(res);
+    pool_release_connection(c);
+    return score;
 }
 
 // ---------- Cache Section ----------
@@ -233,12 +329,14 @@ void cache_update(int id, int score)
     if (cache_count >= MAX_CACHE_SIZE)
     {
         /* remove tail from hash and LRU list */
-        int evict_id = tail->id;
-        HASH_DEL(cache_map, tail);
         LRUNode *old_tail = tail;
-        lru_remove(old_tail);
-        free(old_tail);
-        cache_count--;
+        if (old_tail)
+        {
+            HASH_DEL(cache_map, old_tail);
+            lru_remove(old_tail);
+            free(old_tail);
+            cache_count--;
+        }
     }
 
     /* Create new node */
@@ -286,11 +384,33 @@ int cache_get_top(Player *out, int limit)
     qsort(temp, n, sizeof(Player), cmp_desc);
 
     int ret = (n < limit) ? n : limit;
-    memcpy(out, temp, ret * sizeof(Player));
-
+    if (ret > 0)
+        memcpy(out, temp, ret * sizeof(Player));
     pthread_mutex_unlock(&cache_lock);
     return ret;
 }
+
+int cache_get_score(int id)
+{
+    pthread_mutex_lock(&cache_lock);
+
+    LRUNode *node = NULL;
+    HASH_FIND_INT(cache_map, &id, node);
+
+    if (node)
+    {
+        int score = node->score;
+        // Move to front (LRU update)
+        lru_remove(node);
+        lru_push_front(node);
+        pthread_mutex_unlock(&cache_lock);
+        return score;
+    }
+
+    pthread_mutex_unlock(&cache_lock);
+    return -1;
+}
+
 // ---------- HTTP Handlers ----------
 static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn_http,
                                       const char *url, const char *method,
@@ -308,18 +428,32 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn_htt
         int count = 0;
         int cache_hit = 0;
 
-        if (mode == 0)
-        {
-            count = db_get_top(top_players, top);
-            cache_hit = 0; // DB path
-        }
-        else
-        {
-            // count = cache_get_top(top_players, top);
-            count = db_get_top(top_players, top);
-            cache_hit = 0;
-            // cache_hit = 1; // Cache path
-        }
+        count = db_get_top(top_players, top);
+
+        // if (mode == 0)
+        // {
+        //     count = db_get_top(top_players, top);
+        //     cache_hit = 0; // DB path
+        // }
+        // else if (mode == 1)
+        // {
+        //     count = cache_get_top(top_players, top);
+        //     cache_hit = 1;
+        // }
+        // else
+        // {
+        //     // hybrid: try cache first, then DB
+        //     count = cache_get_top(top_players, top);
+        //     if (count == 0)
+        //     {
+        //         count = db_get_top(top_players, top);
+        //         cache_hit = 0;
+        //     }
+        //     else
+        //     {
+        //         cache_hit = 1;
+        //     }
+        // }
 
         long long end = now_us();
         printf("[LEADERBOARD] mode=%d cache_hit=%d latency=%lld us\n",
@@ -327,15 +461,15 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn_htt
         fflush(stdout);
 
         // build JSON
-        char json[2048] = "{\"leaderboard\":[";
-        for (int i = 0; i < count; i++)
+        char json[4096];
+        size_t pos = 0;
+        pos += snprintf(json + pos, sizeof(json) - pos, "{\"leaderboard\":[");
+        for (int i = 0; i < count && pos < sizeof(json); i++)
         {
-            char tmp[64];
-            snprintf(tmp, sizeof(tmp), "{\"id\":%d,\"score\":%d}%s",
-                     top_players[i].id, top_players[i].score, (i == count - 1) ? "" : ",");
-            strcat(json, tmp);
+            pos += snprintf(json + pos, sizeof(json) - pos, "{\"id\":%d,\"score\":%d}%s",
+                            top_players[i].id, top_players[i].score, (i == count - 1) ? "" : ",");
         }
-        strcat(json, "]}");
+        pos += snprintf(json + pos, sizeof(json) - pos, "]}");
 
         struct MHD_Response *res = MHD_create_response_from_buffer(strlen(json), strdup(json), MHD_RESPMEM_MUST_FREE);
         MHD_add_response_header(res, "Content-Type", "application/json");
@@ -394,6 +528,62 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn_htt
         return ret;
     }
 
+    if (strcmp(method, "GET") == 0 && strncmp(url, "/get_score", 10) == 0)
+    {
+        long long start = now_us(); // measure start
+
+        const char *id_q = MHD_lookup_connection_value(conn_http, MHD_GET_ARGUMENT_KIND, "player_id");
+        if (!id_q)
+        {
+            const char *err = "{\"error\":\"missing player_id\"}";
+            struct MHD_Response *res = MHD_create_response_from_buffer(strlen(err), (void *)err, MHD_RESPMEM_PERSISTENT);
+            int ret = MHD_queue_response(conn_http, MHD_HTTP_BAD_REQUEST, res);
+            MHD_destroy_response(res);
+            return ret;
+        }
+
+        int id = atoi(id_q);
+        int score = -1;
+        int cache_hit = 0;
+
+        if (mode == 0)
+        {
+            score = db_get_score(id);
+        }
+        else if (mode == 1)
+        {
+            score = cache_get_score(id);
+            cache_hit = (score >= 0) ? 1 : 0;
+        }
+        else
+        { // hybrid
+            score = cache_get_score(id);
+            if (score >= 0)
+            {
+                cache_hit = 1;
+            }
+            else
+            {
+                score = db_get_score(id);
+                cache_hit = 0;
+            }
+        }
+
+        long long end = now_us();
+        printf("[GET] mode=%d cache_hit=%d latency=%lld us (id=%d score=%d)\n",
+               mode, cache_hit, (end - start), id, score);
+        fflush(stdout);
+
+        char json[128];
+        snprintf(json, sizeof(json), "{\"id\":%d,\"score\":%d,\"cache_hit\":%d}", id, score, cache_hit);
+
+        struct MHD_Response *res = MHD_create_response_from_buffer(strlen(json), strdup(json), MHD_RESPMEM_MUST_FREE);
+        MHD_add_response_header(res, "Content-Type", "application/json");
+        int ret = MHD_queue_response(conn_http, MHD_HTTP_OK, res);
+        MHD_destroy_response(res);
+        return ret;
+    }
+
     const char *nf = "Not Found";
     struct MHD_Response *res = MHD_create_response_from_buffer(strlen(nf), (void *)nf, MHD_RESPMEM_PERSISTENT);
     int ret = MHD_queue_response(conn_http, MHD_HTTP_NOT_FOUND, res);
@@ -406,8 +596,16 @@ static struct MHD_Daemon *http_daemon;
 
 void cleanup(int sig)
 {
-    if (conn)
-        PQfinish(conn);
+    // finish pool connections
+    for (int i = 0; i < POOL_SIZE; i++)
+    {
+        if (pool[i])
+        {
+            PQfinish(pool[i]);
+            pool[i] = NULL;
+        }
+    }
+
     if (http_daemon)
         MHD_stop_daemon(http_daemon);
     printf("\nServer stopped.\n");
@@ -431,7 +629,7 @@ int main(int argc, char **argv)
         port,
         NULL, NULL,
         &handle_request, NULL,
-        MHD_OPTION_THREAD_POOL_SIZE, 8, // <--- 8 threads
+        MHD_OPTION_THREAD_POOL_SIZE, 20,
         MHD_OPTION_END);
     if (!http_daemon)
     {

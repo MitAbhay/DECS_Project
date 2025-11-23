@@ -24,7 +24,11 @@ typedef struct
 {
     const char *base_url;
     int requests;
-    int mode; // 0=update only, 1=get only, 2=mixed
+    int mode;
+    /*0 = update only
+1 = leaderboard only
+2 = mixed update+leaderboard
+3 = get_score only*/
 } ThreadArgs;
 
 double now_ms()
@@ -45,7 +49,7 @@ void *worker(void *arg)
     char url[256];
     for (int i = 0; i < ta->requests; i++)
     {
-        int pid = rand() % 10000 + 1;
+        int pid = rand() % 100000 + 1;
         int score = rand() % 50000;
 
         if (ta->mode == 0)
@@ -62,6 +66,17 @@ void *worker(void *arg)
             // GET only
             snprintf(url, sizeof(url), "%s/leaderboard?top=10",
                      ta->base_url);
+            curl_easy_setopt(curl, CURLOPT_URL, url);
+            curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
+            curl_easy_perform(curl);
+        }
+        else if (ta->mode == 3)
+        {
+            int pid = rand() % 10000 + 1;
+
+            snprintf(url, sizeof(url), "%s/get_score?player_id=%d",
+                     ta->base_url, pid);
+
             curl_easy_setopt(curl, CURLOPT_URL, url);
             curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
             curl_easy_perform(curl);
@@ -117,12 +132,10 @@ int main(int argc, char **argv)
     double end = now_ms();
 
     double total;
-    if (mode == 0)
-        total = threads * reqs; // update only
-    else if (mode == 1)
-        total = threads * reqs; // get only
+    if (mode == 2)
+        total = threads * reqs * 2; // mixed
     else
-        total = threads * reqs * 2; // mixed (update + get)
+        total = threads * reqs; // others
 
     printf("\n=== Load Test Summary ===\n");
     printf("Mode: %d\n", mode);
