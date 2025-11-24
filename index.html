@@ -1,0 +1,588 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>High-Performance Leaderboard Server</title>
+    <style>
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+
+      body {
+        font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+        background: #1a1a1a;
+      }
+
+      .slide {
+        width: 100vw;
+        height: 100vh;
+        background: white;
+        padding: 4vh 5vw;
+        display: flex;
+        flex-direction: column;
+        page-break-after: always;
+      }
+
+      .slide-header {
+        border-bottom: 0.4vh solid #2563eb;
+        padding-bottom: 2vh;
+        margin-bottom: 3vh;
+      }
+
+      .slide-title {
+        font-size: 4.5vh;
+        color: #1e3a8a;
+        font-weight: bold;
+        margin-bottom: 0.5vh;
+      }
+
+      .slide-subtitle {
+        font-size: 2.2vh;
+        color: #64748b;
+      }
+
+      .slide-content {
+        flex: 1;
+        overflow: hidden;
+      }
+
+      /* Title Slide */
+      .title-slide {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        justify-content: center;
+        align-items: center;
+        text-align: center;
+      }
+
+      .title-slide .main-title {
+        font-size: 6vh;
+        font-weight: bold;
+        margin-bottom: 2vh;
+      }
+
+      .title-slide .subtitle {
+        font-size: 3vh;
+        margin-bottom: 4vh;
+        color: #e0e7ff;
+      }
+
+      .title-slide .author {
+        font-size: 2.5vh;
+        color: #e0e7ff;
+      }
+
+      /* Architecture Boxes */
+      .arch-row {
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        gap: 2vw;
+        margin: 1.5vh 0;
+      }
+
+      .arch-box {
+        padding: 1.5vh 2vw;
+        border-radius: 1vh;
+        font-size: 1.8vh;
+        font-weight: 600;
+        text-align: center;
+        min-width: 15vw;
+        border: 0.3vh solid;
+      }
+
+      .arch-box small {
+        font-size: 1.4vh;
+      }
+
+      .box-load {
+        background: #dbeafe;
+        border-color: #3b82f6;
+        color: #1e40af;
+      }
+      .box-http {
+        background: #d1fae5;
+        border-color: #10b981;
+        color: #065f46;
+      }
+      .box-cache {
+        background: #fef3c7;
+        border-color: #f59e0b;
+        color: #92400e;
+      }
+      .box-db {
+        background: #fee2e2;
+        border-color: #ef4444;
+        color: #991b1b;
+      }
+
+      .arrow-down {
+        text-align: center;
+        font-size: 3vh;
+        color: #64748b;
+        margin: 0.5vh 0;
+      }
+
+      .workload-boxes {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 2vw;
+        margin-top: 2vh;
+      }
+
+      .workload-box {
+        padding: 1.5vh;
+        background: #f8fafc;
+        border-radius: 1vh;
+        border-left: 0.4vh solid #2563eb;
+      }
+
+      .workload-box h3 {
+        color: #1e40af;
+        font-size: 2vh;
+        margin-bottom: 1vh;
+      }
+
+      .workload-box p {
+        color: #475569;
+        font-size: 1.6vh;
+        line-height: 1.5;
+      }
+
+      /* Two Column Layout */
+      .two-col {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 2vw;
+        height: 100%;
+      }
+
+      .info-card {
+        background: #f8fafc;
+        padding: 1.5vh 1.5vw;
+        border-radius: 1vh;
+        border-left: 0.4vh solid #2563eb;
+        margin-bottom: 1.5vh;
+      }
+
+      .info-card h3 {
+        color: #1e40af;
+        font-size: 2vh;
+        margin-bottom: 1vh;
+      }
+
+      .info-card ul {
+        list-style: none;
+        padding: 0;
+      }
+
+      .info-card li {
+        padding: 0.5vh 0;
+        color: #475569;
+        font-size: 1.6vh;
+        line-height: 1.4;
+      }
+
+      .info-card li::before {
+        content: "▸ ";
+        color: #2563eb;
+        font-weight: bold;
+        margin-right: 0.5vw;
+      }
+
+      /* Metrics Grid */
+      .metrics {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 1.5vw;
+        margin-top: 2vh;
+      }
+
+      .metric {
+        background: white;
+        padding: 1.5vh 1vw;
+        border-radius: 1vh;
+        border: 0.2vh solid #e2e8f0;
+        text-align: center;
+      }
+
+      .metric-label {
+        font-size: 1.5vh;
+        color: #64748b;
+        margin-bottom: 0.5vh;
+      }
+
+      .metric-value {
+        font-size: 3vh;
+        font-weight: bold;
+        color: #1e40af;
+      }
+
+      .metric-unit {
+        font-size: 1.6vh;
+        color: #64748b;
+      }
+
+      /* Graph Placeholders */
+      .graphs-2x2 {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 1.5vw;
+        margin-bottom: 2vh;
+        height: 60%;
+      }
+
+      .graph {
+        background: #f1f5f9;
+        border: 0.2vh dashed #cbd5e1;
+        border-radius: 1vh;
+        padding: 2vh;
+        text-align: center;
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+      }
+
+      .graph-title {
+        font-size: 1.8vh;
+        font-weight: 600;
+        color: #1e40af;
+        margin-bottom: 1vh;
+      }
+
+      .graph-value {
+        font-size: 2.2vh;
+        color: #475569;
+        margin-bottom: 0.5vh;
+      }
+
+      .graph-note {
+        font-size: 1.5vh;
+        color: #64748b;
+      }
+
+      .bottleneck-note {
+        padding: 1.5vh;
+        border-radius: 1vh;
+        border-left: 0.4vh solid;
+        font-size: 1.6vh;
+        line-height: 1.6;
+      }
+
+      .bottleneck-io {
+        background: #fee2e2;
+        border-color: #ef4444;
+        color: #475569;
+      }
+
+      .bottleneck-cpu {
+        background: #dbeafe;
+        border-color: #3b82f6;
+        color: #475569;
+      }
+
+      .highlight {
+        background: #fef3c7;
+        padding: 0.2vh 0.5vw;
+        border-radius: 0.3vh;
+        font-weight: 600;
+        color: #92400e;
+      }
+
+      .bottleneck {
+        background: #fee2e2;
+        padding: 0.2vh 0.5vw;
+        border-radius: 0.3vh;
+        font-weight: 600;
+        color: #991b1b;
+      }
+
+      code {
+        background: #f1f5f9;
+        padding: 0.2vh 0.5vw;
+        border-radius: 0.3vh;
+        font-family: "Courier New", monospace;
+        font-size: 1.5vh;
+      }
+
+      .footer {
+        text-align: right;
+        color: #94a3b8;
+        font-size: 1.4vh;
+        margin-top: 1vh;
+      }
+
+      @media print {
+        body {
+          background: white;
+        }
+        .slide {
+          page-break-after: always;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <!-- Slide 1: Title -->
+    <div class="slide title-slide">
+      <div class="main-title">High-Performance<br />Leaderboard Server</div>
+      <div class="subtitle">Performance Testing and Bottleneck Analysis</div>
+      <div class="author">
+        Abhay Kumar Mittal<br />
+        Student ID: 25m0822
+      </div>
+    </div>
+
+    <!-- Slide 2: System Architecture -->
+    <div class="slide">
+      <div class="slide-header">
+        <div class="slide-title">System Architecture</div>
+        <div class="slide-subtitle">
+          Multi-Tier Caching with Two Bottleneck Scenarios
+        </div>
+      </div>
+      <div class="slide-content">
+              <img width="90%" height="800" src="arch_update.jpg" />
+      </div>
+      <div class="footer">Slide 2</div>
+    </div>
+
+    <!-- Slide 3: Development Process -->
+    <div class="slide">
+      <div class="slide-header">
+        <div class="slide-title">Development Process</div>
+        <div class="slide-subtitle">
+          Implementation Details and Technology Stack
+        </div>
+      </div>
+      <div class="slide-content">
+        <div class="two-col">
+          <div>
+            <div class="info-card">
+              <h3>📊 Code Statistics</h3>
+              <ul>
+                <li><strong>Server Code:</strong> ~1,200 lines of C</li>
+                <li><strong>Load Generator:</strong> ~400 lines of C</li>
+                <li><strong>Analysis Scripts:</strong> ~300 lines Python</li>
+                <li><strong>Total:</strong> ~1,900 lines of code</li>
+                <li><strong>Repository:</strong> Available on GitHub</li>
+              </ul>
+            </div>
+
+            <div class="info-card">
+              <h3>🛠️ Third-Party Software</h3>
+              <ul>
+                <li><strong>libmicrohttpd:</strong> HTTP server</li>
+                <li><strong>PostgreSQL 14+:</strong> Database</li>
+                <li><strong>uthash:</strong> Hash table library</li>
+                <li><strong>libcurl:</strong> HTTP client</li>
+                <li><strong>libpq:</strong> PostgreSQL client</li>
+              </ul>
+            </div>
+          </div>
+
+          <div>
+            <div class="info-card">
+              <h3>🎯 Key Features</h3>
+              <ul>
+                <li>Multi-threaded HTTP server</li>
+                <li>LRU cache with O(1) operations</li>
+                <li>Top-N sorted cache</li>
+                <li>Connection pooling (64 conns)</li>
+                <li>Four operating modes</li>
+                <li>Thread-safe structures</li>
+              </ul>
+            </div>
+
+            <div class="info-card">
+              <h3>📈 API Endpoints</h3>
+              <ul>
+                <li><code>POST /update_score</code> - Update</li>
+                <li><code>GET /leaderboard</code> - Top N</li>
+                <li><code>GET /get_score</code> - Individual</li>
+              </ul>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="footer">Slide 3</div>
+    </div>
+
+    <!-- Slide 4: Load Generator Design -->
+    <div class="slide">
+      <div class="slide-header">
+        <div class="slide-title">Load Generator Design</div>
+        <div class="slide-subtitle">
+          Open-Loop Architecture for High Load Generation
+        </div>
+      </div>
+      <div class="slide-content">
+        <div class="two-col">
+          <div>
+            <div class="info-card">
+              <h3>🏗️ Architecture</h3>
+              <ul>
+                <li>
+                  <strong>Type:</strong>
+                  <span class="highlight">Open-Loop</span>
+                </li>
+                <li><strong>Implementation:</strong> Multi-threaded C</li>
+                <li><strong>HTTP Client:</strong> libcurl</li>
+                <li><strong>Rate:</strong> Independent of response time</li>
+                <li><strong>Configurable:</strong> Threads, requests, mode</li>
+              </ul>
+            </div>
+
+            <div class="info-card">
+              <h3>📊 Workload Modes</h3>
+              <ul>
+                <li><strong>Mode 0:</strong> Update-only (POST)</li>
+                <li><strong>Mode 1:</strong> Leaderboard (GET)</li>
+                <li><strong>Mode 2:</strong> Mixed (POST + GET)</li>
+                <li><strong>Mode 3:</strong> Score queries (GET)</li>
+              </ul>
+            </div>
+          </div>
+
+          <div>
+            <div class="info-card">
+              <h3>⚡ Load Capacity</h3>
+              <ul>
+                <li><strong>Max Threads:</strong> 96 tested</li>
+                <li><strong>Requests/Thread:</strong> 250-10,000</li>
+                <li><strong>Max Load:</strong> >15,000 req/sec</li>
+                <li><strong>Random Data:</strong> IDs (1-100K)</li>
+              </ul>
+            </div>
+
+            <div class="info-card">
+              <h3>✅ Validation</h3>
+              <ul>
+                <li><strong>CPU Pinning:</strong> Cores 2-4</li>
+                <li><strong>Verified:</strong> Saturated server</li>
+                <li><strong>No Bottleneck:</strong> Never limited</li>
+                <li><strong>Formula:</strong> Threads × Reqs ÷ Time</li>
+              </ul>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="footer">Slide 4</div>
+    </div>
+
+    <!-- Slide 5: Load Test Setup -->
+    <div class="slide">
+      <div class="slide-header">
+        <div class="slide-title">Load Test Setup</div>
+        <div class="slide-subtitle">
+          Experimental Configuration and Methodology
+        </div>
+      </div>
+      <div class="slide-content">
+        <div class="two-col">
+          <div>
+            <div class="info-card">
+              <h3>💻 Hardware & Deployment</h3>
+              <ul>
+                <li><strong>Machine:</strong> Single (localhost)</li>
+                <li><strong>CPU:</strong> Intel i5-1135G7 (8 cores)</li>
+                <li><strong>RAM:</strong> 16 GB</li>
+                <li><strong>Storage:</strong> SSD</li>
+                <li><strong>OS:</strong> Linux Ubuntu</li>
+              </ul>
+            </div>
+
+            <div class="info-card">
+              <h3>📍 CPU Pinning</h3>
+              <ul>
+                <li><strong>Server:</strong> Core 1 (isolated)</li>
+                <li><strong>PostgreSQL:</strong> Cores 5-6</li>
+                <li><strong>Load Gen:</strong> Cores 2-4</li>
+                <li><strong>Purpose:</strong> Resource isolation</li>
+              </ul>
+            </div>
+          </div>
+
+          <div>
+            <div class="info-card">
+              <h3>🧪 Methodology</h3>
+              <ul>
+                <li><strong>Warm-up:</strong> 30 seconds</li>
+                <li><strong>Measurement:</strong> 5 minutes/level</li>
+                <li><strong>Cool-down:</strong> 30 seconds</li>
+                <li><strong>Load Levels:</strong> 6 per workload</li>
+                <li><strong>Experiments:</strong> 12 total runs</li>
+              </ul>
+            </div>
+
+            <div class="info-card">
+              <h3>📊 Metrics Measured</h3>
+              <ul>
+                <li><strong>Throughput:</strong> Req/sec</li>
+                <li><strong>Latency:</strong> Avg response (ms)</li>
+                <li><strong>CPU:</strong> % usage (psutil)</li>
+                <li><strong>I/O:</strong> % disk busy (iostat)</li>
+              </ul>
+            </div>
+          </div>
+        </div>
+
+        <div class="metrics">
+          <div class="metric">
+            <div class="metric-label">Workload 1 Range</div>
+            <div class="metric-value">
+              8-96<span class="metric-unit"> threads</span>
+            </div>
+          </div>
+          <div class="metric">
+            <div class="metric-label">Workload 2 Range</div>
+            <div class="metric-value">
+              8-64<span class="metric-unit"> threads</span>
+            </div>
+          </div>
+          <div class="metric">
+            <div class="metric-label">Test Duration</div>
+            <div class="metric-value">
+              5<span class="metric-unit"> min</span>
+            </div>
+          </div>
+          <div class="metric">
+            <div class="metric-label">Total Time</div>
+            <div class="metric-value">
+              60<span class="metric-unit"> min</span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="footer">Slide 5</div>
+    </div>
+
+    <!-- Slide 6: Workload 1 Results -->
+    <div class="slide">
+      <div class="slide-header">
+        <div class="slide-title">Workload 1: I/O Bottleneck</div>
+        <div class="slide-subtitle">
+          Mode 2 (LRU Cache + Database) - Update-Heavy Operations
+        </div>
+      </div>
+      <img width="100%" height="900" src="workload1_mode2_combined.png" />
+      <div class="footer">Slide 6</div>
+    </div>
+
+    <!-- Slide 7: Workload 2 Results -->
+    <div class="slide">
+      <div class="slide-header">
+        <div class="slide-title">Workload 2: Mixed Bottleneck</div>
+        <div class="slide-subtitle">
+          Mode 3 (All Components) - Mixed Operations
+        </div>
+      </div>
+           <img width="100%" height="900" src="mode3_mixed_combined.png" />
+      </div>
+      <div class="footer">Slide 7</div>
+    </div>
+  </body>
+</html>

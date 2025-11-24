@@ -1,10 +1,10 @@
 /*
 Compile:
-gcc -O2 -Wall server_simple.c -o server -lmicrohttpd -lpq -pthread
+gcc -O2 -Wall server.c -o server -lmicrohttpd -lpq -pthread
 
 Usage:
 ./server <port> <mode>
-mode = 0 (DB-only), 1 (Cache-only), 2 (Hybrid)
+mode = 0 (DB-only), 1 (LRU Cache + Top-N Cache only), 2 (LRU Cache + DB), 3 (All: LRU Cache + Top-N Cache + DB)
 */
 
 #include <microhttpd.h>
@@ -23,15 +23,29 @@ mode = 0 (DB-only), 1 (Cache-only), 2 (Hybrid)
 #define DEFAULT_TOP 10
 
 #define MAX_CACHE_SIZE 1000
-#define POOL_SIZE 90
+#define POOL_SIZE 64
+#define TOP_N_SIZE 100 // Keep top 100 scores in sorted cache
 
 typedef struct LRUNode
 {
     int id;
     int score;
     struct LRUNode *prev, *next;
-    UT_hash_handle hh; /* makes this struct hashable by uthash */
+    UT_hash_handle hh;
 } LRUNode;
+
+typedef struct
+{
+    int id;
+    int score;
+} Player;
+
+// Top-N Cache Structure (sorted array)
+typedef struct
+{
+    Player players[TOP_N_SIZE];
+    int count; // actual number of entries (0 to TOP_N_SIZE)
+} TopNCache;
 
 static PGconn *pool[POOL_SIZE];
 static int pool_busy[POOL_SIZE];
@@ -40,16 +54,14 @@ pthread_cond_t pool_wait = PTHREAD_COND_INITIALIZER;
 
 static LRUNode *head = NULL, *tail = NULL;
 static int cache_count = 0;
-static LRUNode *cache_map = NULL; /* uthash hash table root (player_id -> node) */
+static LRUNode *cache_map = NULL;
 pthread_mutex_t cache_lock = PTHREAD_MUTEX_INITIALIZER;
 
-typedef struct
-{
-    int id;
-    int score;
-} Player;
+// Top-N Cache
+static TopNCache topn_cache = {{0}, 0};
+pthread_mutex_t topn_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static int mode = 0; // 0=DB, 1=Cache, 2=Hybrid
+static int mode = 0; // 0=DB-only, 1=Caches-only, 2=LRU+DB, 3=All
 
 long long now_us()
 {
@@ -91,7 +103,6 @@ void pool_init()
         if (!pool[i])
         {
             fprintf(stderr, "Failed to initialize DB pool at index %d\n", i);
-            // Clean up any connections created so far.
             for (int j = 0; j < i; j++)
             {
                 if (pool[j])
@@ -117,14 +128,12 @@ PGconn *pool_get_connection()
                 pool_busy[i] = 1;
                 PGconn *c = pool[i];
 
-                // auto-repair dead connections
                 if (PQstatus(c) != CONNECTION_OK)
                 {
                     PQreset(c);
                     if (PQstatus(c) != CONNECTION_OK)
                     {
                         fprintf(stderr, "Warning: PQreset failed: %s\n", PQerrorMessage(c));
-                        // allow caller to detect error via PQresultStatus checks
                     }
                 }
 
@@ -248,8 +257,6 @@ int db_get_score(int id)
 
     if (PQresultStatus(res) != PGRES_TUPLES_OK)
     {
-        // no rows or error
-        // If it's an error, log it.
         if (PQntuples(res) == 0)
         {
             PQclear(res);
@@ -279,7 +286,7 @@ int db_get_score(int id)
     return score;
 }
 
-// ---------- Cache Section ----------
+// ---------- LRU Cache Section ----------
 
 void lru_remove(LRUNode *node)
 {
@@ -315,7 +322,6 @@ void cache_update(int id, int score)
     LRUNode *node = NULL;
     HASH_FIND_INT(cache_map, &id, node);
 
-    /* If exists, update and move to front */
     if (node)
     {
         node->score = score;
@@ -325,10 +331,8 @@ void cache_update(int id, int score)
         return;
     }
 
-    /* Evict if full */
     if (cache_count >= MAX_CACHE_SIZE)
     {
-        /* remove tail from hash and LRU list */
         LRUNode *old_tail = tail;
         if (old_tail)
         {
@@ -339,7 +343,6 @@ void cache_update(int id, int score)
         }
     }
 
-    /* Create new node */
     node = (LRUNode *)malloc(sizeof(LRUNode));
     if (!node)
     {
@@ -350,44 +353,11 @@ void cache_update(int id, int score)
     node->score = score;
     node->prev = node->next = NULL;
 
-    /* insert into LRU front and into hash */
     lru_push_front(node);
     HASH_ADD_INT(cache_map, id, node);
     cache_count++;
 
     pthread_mutex_unlock(&cache_lock);
-}
-
-int cmp_desc(const void *a, const void *b)
-{
-    const Player *pa = a, *pb = b;
-    return pb->score - pa->score;
-}
-
-int cache_get_top(Player *out, int limit)
-{
-    pthread_mutex_lock(&cache_lock);
-
-    /* temp array sized by cache_count (bounded by MAX_CACHE_SIZE) */
-    int n = 0;
-    Player temp[MAX_CACHE_SIZE];
-    LRUNode *cur = head;
-    while (cur && n < cache_count)
-    {
-        temp[n].id = cur->id;
-        temp[n].score = cur->score;
-        cur = cur->next;
-        n++;
-    }
-
-    /* sort by score desc */
-    qsort(temp, n, sizeof(Player), cmp_desc);
-
-    int ret = (n < limit) ? n : limit;
-    if (ret > 0)
-        memcpy(out, temp, ret * sizeof(Player));
-    pthread_mutex_unlock(&cache_lock);
-    return ret;
 }
 
 int cache_get_score(int id)
@@ -400,7 +370,6 @@ int cache_get_score(int id)
     if (node)
     {
         int score = node->score;
-        // Move to front (LRU update)
         lru_remove(node);
         lru_push_front(node);
         pthread_mutex_unlock(&cache_lock);
@@ -411,6 +380,116 @@ int cache_get_score(int id)
     return -1;
 }
 
+// ---------- Top-N Cache Section ----------
+
+// Initialize Top-N cache from database
+void topn_init_from_db()
+{
+    pthread_mutex_lock(&topn_lock);
+
+    Player temp[TOP_N_SIZE];
+    int count = db_get_top(temp, TOP_N_SIZE);
+
+    topn_cache.count = count;
+    for (int i = 0; i < count; i++)
+    {
+        topn_cache.players[i] = temp[i];
+    }
+
+    printf("Top-N cache initialized with %d players from DB\n", count);
+    pthread_mutex_unlock(&topn_lock);
+}
+
+// Check if score qualifies for top-N (must hold topn_lock before calling)
+int is_topn_score(int score)
+{
+    // If cache not full, any score qualifies
+    if (topn_cache.count < TOP_N_SIZE)
+        return 1;
+
+    // Check if score is higher than lowest in cache
+    return score > topn_cache.players[topn_cache.count - 1].score;
+}
+
+// Update Top-N cache (sorted array, must hold topn_lock)
+void topn_update(int id, int score)
+{
+    pthread_mutex_lock(&topn_lock);
+
+    // Find if player already exists in top-N
+    int existing_idx = -1;
+    for (int i = 0; i < topn_cache.count; i++)
+    {
+        if (topn_cache.players[i].id == id)
+        {
+            existing_idx = i;
+            break;
+        }
+    }
+
+    // If exists, remove old entry
+    if (existing_idx >= 0)
+    {
+        for (int i = existing_idx; i < topn_cache.count - 1; i++)
+        {
+            topn_cache.players[i] = topn_cache.players[i + 1];
+        }
+        topn_cache.count--;
+    }
+
+    // Check if new score qualifies for top-N
+    if (!is_topn_score(score) && existing_idx < 0)
+    {
+        pthread_mutex_unlock(&topn_lock);
+        return;
+    }
+
+    // Find insertion position
+    int pos = 0;
+    for (pos = 0; pos < topn_cache.count; pos++)
+    {
+        if (score > topn_cache.players[pos].score)
+            break;
+    }
+
+    // Shift elements down
+    if (topn_cache.count < TOP_N_SIZE)
+    {
+        for (int i = topn_cache.count; i > pos; i--)
+        {
+            topn_cache.players[i] = topn_cache.players[i - 1];
+        }
+        topn_cache.count++;
+    }
+    else
+    {
+        // Cache full, shift and discard last
+        for (int i = TOP_N_SIZE - 1; i > pos; i--)
+        {
+            topn_cache.players[i] = topn_cache.players[i - 1];
+        }
+    }
+
+    // Insert new entry
+    topn_cache.players[pos].id = id;
+    topn_cache.players[pos].score = score;
+
+    pthread_mutex_unlock(&topn_lock);
+}
+
+// Get top N from cache
+int topn_get_top(Player *out, int limit)
+{
+    pthread_mutex_lock(&topn_lock);
+
+    int ret = (topn_cache.count < limit) ? topn_cache.count : limit;
+    if (ret > 0)
+        memcpy(out, topn_cache.players, ret * sizeof(Player));
+
+    pthread_mutex_unlock(&topn_lock);
+    return ret;
+}
+
 // ---------- HTTP Handlers ----------
 static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn_http,
                                       const char *url, const char *method,
@@ -419,7 +498,7 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn_htt
 {
     if (strcmp(method, "GET") == 0 && strncmp(url, "/leaderboard", 12) == 0)
     {
-        long long start = now_us(); // measure start
+        long long start = now_us();
 
         const char *top_q = MHD_lookup_connection_value(conn_http, MHD_GET_ARGUMENT_KIND, "top");
         int top = top_q ? atoi(top_q) : DEFAULT_TOP;
@@ -428,39 +507,36 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn_htt
         int count = 0;
         int cache_hit = 0;
 
-        count = db_get_top(top_players, top);
-
-        // if (mode == 0)
-        // {
-        //     count = db_get_top(top_players, top);
-        //     cache_hit = 0; // DB path
-        // }
-        // else if (mode == 1)
-        // {
-        //     count = cache_get_top(top_players, top);
-        //     cache_hit = 1;
-        // }
-        // else
-        // {
-        //     // hybrid: try cache first, then DB
-        //     count = cache_get_top(top_players, top);
-        //     if (count == 0)
-        //     {
-        //         count = db_get_top(top_players, top);
-        //         cache_hit = 0;
-        //     }
-        //     else
-        //     {
-        //         cache_hit = 1;
-        //     }
-        // }
+        if (mode == 0)
+        {
+            // DB-only
+            count = db_get_top(top_players, top);
+            cache_hit = 0;
+        }
+        else if (mode == 1)
+        {
+            // Caches-only: use Top-N cache
+            count = topn_get_top(top_players, top);
+            cache_hit = 1;
+        }
+        else if (mode == 2)
+        {
+            // LRU Cache + DB: use DB for leaderboard (LRU doesn't guarantee top-N)
+            count = db_get_top(top_players, top);
+            cache_hit = 0;
+        }
+        else if (mode == 3)
+        {
+            // All: use Top-N cache
+            count = topn_get_top(top_players, top);
+            cache_hit = 1;
+        }
 
         long long end = now_us();
         printf("[LEADERBOARD] mode=%d cache_hit=%d latency=%lld us\n",
                mode, cache_hit, (end - start));
         fflush(stdout);
 
-        // build JSON
         char json[4096];
         size_t pos = 0;
         pos += snprintf(json + pos, sizeof(json) - pos, "{\"leaderboard\":[");
@@ -480,7 +556,7 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn_htt
 
     if (strcmp(method, "POST") == 0 && strncmp(url, "/update_score", 13) == 0)
     {
-        long long start = now_us(); // start timing
+        long long start = now_us();
 
         const char *id_q = MHD_lookup_connection_value(conn_http, MHD_GET_ARGUMENT_KIND, "player_id");
         const char *score_q = MHD_lookup_connection_value(conn_http, MHD_GET_ARGUMENT_KIND, "score");
@@ -496,29 +572,44 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn_htt
         int id = atoi(id_q);
         int score = atoi(score_q);
 
-        int wrote_cache = 0, wrote_db = 0;
+        int wrote_lru = 0, wrote_topn = 0, wrote_db = 0;
 
         if (mode == 0)
         {
+            // DB-only
             db_update(id, score);
             wrote_db = 1;
         }
         else if (mode == 1)
         {
+            // Caches-only: update both LRU and Top-N caches
             cache_update(id, score);
-            wrote_cache = 1;
+            topn_update(id, score);
+            wrote_lru = 1;
+            wrote_topn = 1;
         }
-        else
-        { // hybrid
+        else if (mode == 2)
+        {
+            // LRU Cache + DB: update LRU and DB
             cache_update(id, score);
             db_update(id, score);
-            wrote_cache = 1;
+            wrote_lru = 1;
+            wrote_db = 1;
+        }
+        else if (mode == 3)
+        {
+            // All: update LRU, Top-N, and DB
+            cache_update(id, score);
+            topn_update(id, score);
+            db_update(id, score);
+            wrote_lru = 1;
+            wrote_topn = 1;
             wrote_db = 1;
         }
 
         long long end = now_us();
-        printf("[UPDATE] mode=%d wrote_cache=%d wrote_db=%d latency=%lld us (id=%d score=%d)\n",
-               mode, wrote_cache, wrote_db, (end - start), id, score);
+        printf("[UPDATE] mode=%d lru=%d topn=%d db=%d latency=%lld us (id=%d score=%d)\n",
+               mode, wrote_lru, wrote_topn, wrote_db, (end - start), id, score);
         fflush(stdout);
 
         const char *ok = "{\"status\":\"ok\"}";
@@ -530,7 +621,7 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn_htt
 
     if (strcmp(method, "GET") == 0 && strncmp(url, "/get_score", 10) == 0)
     {
-        long long start = now_us(); // measure start
+        long long start = now_us();
 
         const char *id_q = MHD_lookup_connection_value(conn_http, MHD_GET_ARGUMENT_KIND, "player_id");
         if (!id_q)
@@ -548,15 +639,33 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn_htt
 
         if (mode == 0)
         {
+            // DB-only
             score = db_get_score(id);
+            cache_hit = 0;
         }
         else if (mode == 1)
         {
+            // Caches-only: try LRU cache
             score = cache_get_score(id);
             cache_hit = (score >= 0) ? 1 : 0;
         }
-        else
-        { // hybrid
+        else if (mode == 2)
+        {
+            // LRU Cache + DB: try LRU first, fallback to DB
+            score = cache_get_score(id);
+            if (score >= 0)
+            {
+                cache_hit = 1;
+            }
+            else
+            {
+                score = db_get_score(id);
+                cache_hit = 0;
+            }
+        }
+        else if (mode == 3)
+        {
+            // All: try LRU first, fallback to DB
             score = cache_get_score(id);
             if (score >= 0)
             {
@@ -596,7 +705,6 @@ static struct MHD_Daemon *http_daemon;
 
 void cleanup(int sig)
 {
-    // finish pool connections
     for (int i = 0; i < POOL_SIZE; i++)
     {
         if (pool[i])
@@ -615,12 +723,42 @@ void cleanup(int sig)
 int main(int argc, char **argv)
 {
     int port = (argc > 1) ? atoi(argv[1]) : DEFAULT_PORT;
-    mode = (argc > 2) ? atoi(argv[2]) : 2;
+    mode = (argc > 2) ? atoi(argv[2]) : 3;
 
     printf("Starting server on port %d, mode=%d\n", port, mode);
 
-    if (mode != 1)
-        pool_init(); // DB required for modes 0 and 2
+    // Initialize DB pool for modes 0, 2, 3
+    if (mode == 0 || mode == 2 || mode == 3)
+    {
+        pool_init();
+        printf("DB pool initialized\n");
+    }
+
+    // Initialize Top-N cache for modes 1 and 3
+    if (mode == 1 || mode == 3)
+    {
+        if (mode == 3)
+        {
+            // Mode 3: Initialize from DB
+            topn_init_from_db();
+        }
+        else
+        {
+            // Mode 1: Empty cache (will be populated as updates come)
+            printf("Top-N cache initialized (empty, cache-only mode)\n");
+        }
+    }
+
+    printf("\n=== Mode Configuration ===\n");
+    if (mode == 0)
+        printf("Mode 0: DB-only\n");
+    else if (mode == 1)
+        printf("Mode 1: LRU Cache + Top-N Cache (no DB)\n");
+    else if (mode == 2)
+        printf("Mode 2: LRU Cache + DB (no Top-N cache)\n");
+    else if (mode == 3)
+        printf("Mode 3: LRU Cache + Top-N Cache + DB (All)\n");
+    printf("=========================\n\n");
 
     signal(SIGINT, cleanup);
 
@@ -629,7 +767,7 @@ int main(int argc, char **argv)
         port,
         NULL, NULL,
         &handle_request, NULL,
-        MHD_OPTION_THREAD_POOL_SIZE, 20,
+        MHD_OPTION_THREAD_POOL_SIZE, 10,
         MHD_OPTION_END);
     if (!http_daemon)
     {

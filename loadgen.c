@@ -22,6 +22,70 @@ Usage:
 
 typedef struct
 {
+    unsigned long long user, nice, system, idle, iowait, irq, softirq, steal;
+} CpuStats;
+
+CpuStats read_cpu()
+{
+    CpuStats s = {0};
+    FILE *f = fopen("/proc/stat", "r");
+    if (!f)
+        return s;
+
+    fscanf(f, "cpu  %llu %llu %llu %llu %llu %llu %llu %llu",
+           &s.user, &s.nice, &s.system, &s.idle,
+           &s.iowait, &s.irq, &s.softirq, &s.steal);
+    fclose(f);
+    return s;
+}
+
+double cpu_usage_percent(CpuStats a, CpuStats b)
+{
+    unsigned long long idle_a = a.idle + a.iowait;
+    unsigned long long idle_b = b.idle + b.iowait;
+
+    unsigned long long nonidle_a = a.user + a.nice + a.system +
+                                   a.irq + a.softirq + a.steal;
+    unsigned long long nonidle_b = b.user + b.nice + b.system +
+                                   b.irq + b.softirq + b.steal;
+
+    unsigned long long total_a = idle_a + nonidle_a;
+    unsigned long long total_b = idle_b + nonidle_b;
+
+    double totald = (double)(total_b - total_a);
+    double idled = (double)(idle_b - idle_a);
+
+    return (100.0 * (totald - idled) / totald);
+}
+
+typedef struct
+{
+    unsigned long long read_bytes;
+    unsigned long long write_bytes;
+} IoStats;
+
+IoStats read_io()
+{
+    IoStats io = {0};
+    FILE *f = fopen("/proc/self/io", "r");
+    if (!f)
+        return io;
+
+    char key[64];
+    while (fscanf(f, "%63s %llu", key, &io.read_bytes) != EOF)
+    {
+        if (strcmp(key, "read_bytes:") == 0)
+            fscanf(f, "%llu", &io.read_bytes);
+        if (strcmp(key, "write_bytes:") == 0)
+            fscanf(f, "%llu", &io.write_bytes);
+    }
+
+    fclose(f);
+    return io;
+}
+
+typedef struct
+{
     const char *base_url;
     int requests;
     int mode;
@@ -121,8 +185,12 @@ int main(int argc, char **argv)
     pthread_t tids[threads];
     ThreadArgs args = {url, reqs, mode};
 
+    CpuStats c1 = read_cpu();
+    IoStats io1 = read_io();
+
     double start = now_ms();
 
+    /* run loadgen test */
     for (int i = 0; i < threads; i++)
         pthread_create(&tids[i], NULL, worker, &args);
 
@@ -130,6 +198,13 @@ int main(int argc, char **argv)
         pthread_join(tids[i], NULL);
 
     double end = now_ms();
+
+    CpuStats c2 = read_cpu();
+    IoStats io2 = read_io();
+
+    double cpu_percent = cpu_usage_percent(c1, c2);
+    unsigned long long read_delta = io2.read_bytes - io1.read_bytes;
+    unsigned long long write_delta = io2.write_bytes - io1.write_bytes;
 
     double total;
     if (mode == 2)
@@ -143,6 +218,7 @@ int main(int argc, char **argv)
     printf("Total HTTP requests: %.0f\n", total);
     printf("Elapsed: %.2f sec\n", (end - start) / 1000.0);
     printf("Throughput: %.2f req/sec\n", total / ((end - start) / 1000.0));
+    printf("CPU Utilization: %.2f %%\n", cpu_percent);
 
     curl_global_cleanup();
     return 0;

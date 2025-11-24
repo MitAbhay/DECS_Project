@@ -1,0 +1,54 @@
+Mode: 0
+Threads: 8, Requests/thread: 10000
+Total HTTP requests: 80000
+Elapsed: 16.92 sec
+Throughput: 4729.09 req/sec
+CPU Utilization: 70.33 %
+IO Read: 0 bytes
+IO Write: 0 bytes
+
+Mode: 0
+Threads: 16, Requests/thread: 10000
+Total HTTP requests: 160000
+Elapsed: 28.63 sec
+Throughput: 5589.06 req/sec
+CPU Utilization: 79.52 %
+IO Read: 0 bytes
+IO Write: 0 bytes
+
+Mode: 0
+Threads: 32, Requests/thread: 10000
+Total HTTP requests: 320000
+Elapsed: 42.29 sec
+Throughput: 7567.62 req/sec
+CPU Utilization: 70.27 %
+IO Read: 0 bytes
+IO Write: 0 bytes
+
+Mode: 0
+Threads: 48, Requests/thread: 10000
+Total HTTP requests: 480000
+Elapsed: 59.45 sec
+Throughput: 8073.45 req/sec
+CPU Utilization: 67.66 %
+IO Read: 0 bytes
+IO Write: 0 bytes
+
+Mode: 0
+Threads: 64, Requests/thread: 10000
+Total HTTP requests: 640000
+Elapsed: 131.24 sec
+Throughput: 4876.64 req/sec
+CPU Utilization: 79.38 %
+IO Read: 0 bytes
+IO Write: 0 bytes
+
+Mode: 0
+Threads: 96, Requests/thread: 10000
+Total HTTP requests: 960000
+Elapsed: 173.18 sec
+Throughput: 5543.41 req/sec
+CPU Utilization: 77.13 %
+IO Read: 0 bytes
+IO Write: 0 bytes
+
