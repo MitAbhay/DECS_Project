@@ -268,6 +268,3 @@ MIT License - Free to use for educational purposes.
 - Load testing methodologies
 - Concurrent programming patterns
 
----
-
-**Note:** This project is designed for controlled testing environments. Do not expose to public networks without proper security measures.
