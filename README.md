@@ -262,7 +262,7 @@ MIT License - Free to use for educational purposes.
 
 ## 🎓 Learning Objectives
 
-- Understanding I/O vs CPU bottlenecks
+- Understanding I/O vs CPU bottleneck
 - Connection pooling strategies
 - Caching vs persistence trade-offs
 - Load testing methodologies
